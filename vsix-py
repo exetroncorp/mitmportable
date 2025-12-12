@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+import asyncio
+import httpx
+import math
+import tempfile
+import os
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.containers import Vertical, Horizontal, Container
+from textual.widgets import (
+    Input, Label, Button, Footer,
+    Static, LoadingIndicator, OptionList, ListView, ListItem
+)
+from textual.screen import ModalScreen
+from textual.message import Message
+
+API_SEARCH = "https://open-vsx.org/api/-/search"
+API_EXT_INFO = "https://open-vsx.org/api/{namespace}/{name}"
+
+# --- Helper to format numbers ---
+def format_count(count):
+    if count is None: return "0"
+    n = int(count)
+    if n == 0: return "0"
+    size_name = ("", "K", "M", "B")
+    i = int(math.floor(math.log(n, 1000)))
+    p = math.pow(1000, i)
+    s = round(n / p, 1)
+    return f"{s}{size_name[i]}" if i < len(size_name) else f"{n}"
+
+# --- Custom List Item to hold version data safely ---
+class VersionItem(ListItem):
+    def __init__(self, version_label: str, download_url: str):
+        self.version_value = version_label
+        self.download_url = download_url
+        super().__init__(Label(version_label))
+
+# --- Modal Screen for Selecting Versions ---
+class VersionSelectScreen(ModalScreen):
+    CSS = """
+    VersionSelectScreen {
+        align: center middle;
+        background: rgba(0,0,0,0.7);
+    }
+    #dialog {
+        padding: 1 2;
+        width: 60;
+        height: 80%;
+        border: thick $accent;
+        background: $surface;
+    }
+    #version_list {
+        height: 1fr;
+        border: solid $primary-background;
+        margin-top: 1;
+    }
+    VersionItem {
+        padding: 1;
+    }
+    """
+
+    def __init__(self, namespace, name):
+        super().__init__()
+        self.namespace = namespace
+        self.ext_name = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Select Version: {self.namespace}.{self.ext_name}", classes="ext-title")
+            yield LoadingIndicator(id="version_loader")
+            yield ListView(id="version_list")
+            yield Button("Cancel", variant="error", id="cancel_btn")
+
+    def on_mount(self):
+        self.fetch_versions()
+
+    @work
+    async def fetch_versions(self):
+        url = API_EXT_INFO.format(namespace=self.namespace, name=self.ext_name)
+        loader = self.query_one("#version_loader")
+        list_view = self.query_one("#version_list")
+
+        list_view.clear()
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.get(url, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+
+                raw_versions = data.get("versions") or {}
+
+                # Check for "files" structure (some packages use this)
+                if not raw_versions and isinstance(data.get("files"), list):
+                    for entry in data["files"]:
+                        ver = entry.get("version")
+                        download = entry.get("download")
+                        if ver and download:
+                            raw_versions[ver] = download
+
+                # If still nothing -> fallback to latest only
+                if not raw_versions:
+                    current_ver = data.get("version")
+                    download = data.get("files", {}).get("download")
+                    if current_ver and download:
+                        raw_versions = {current_ver: download}
+
+                loader.display = False
+
+                if not raw_versions:
+                    list_view.mount(ListItem(Label(f"No versions found.")))
+                    return
+
+                # Sort versions descending (latest first)
+                sorted_keys = sorted(raw_versions.keys(), reverse=True)
+
+                # --- FIX: show ALL versions ---
+                for ver in sorted_keys:
+                    download_url = raw_versions[ver]
+                    list_view.mount(VersionItem(ver, download_url))
+
+        except Exception as e:
+            loader.display = False
+            list_view.mount(ListItem(Label(f"Error: {str(e)}")))
+
+    @on(ListView.Selected)
+    def on_version_selected(self, event: ListView.Selected):
+        item = event.item
+        if isinstance(item, VersionItem):
+            self.dismiss((item.version_value, item.download_url))
+        else:
+            self.dismiss(None)
+
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+
+# --- Custom Widget for a single Extension Row ---
+class ExtensionRow(Container):
+    class InstallRequest(Message):
+        def __init__(self, ext_data: dict, widget: "ExtensionRow", download_url: str, version: str):
+            self.ext_data = ext_data
+            self.widget = widget
+            self.download_url = download_url
+            self.version = version
+            super().__init__()
+
+    def __init__(self, data: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.data = data
+        self.ext_namespace = data.get('namespace', 'unknown')
+        self.ext_name = data.get('name', 'unknown')
+        self.ext_desc = data.get('description', '') or "No description provided."
+        self.ext_downloads = format_count(data.get('downloadCount', 0))
+        self.latest_ver = data.get('version', '')
+
+    def compose(self) -> ComposeResult:
+        yield Static("🧩", classes="ext-logo")
+        with Vertical(classes="ext-meta"):
+            yield Label(f"[b]{self.ext_name}[/b] [dim]{self.latest_ver}[/]", classes="ext-title")
+            with Horizontal(classes="ext-subtitle"):
+                yield Label(f"[blue]@{self.ext_namespace}[/]", classes="ext-publisher")
+                yield Label(f"⬇ {self.ext_downloads}", classes="ext-downloads")
+            yield Label(self.ext_desc[:90] + ("..." if len(self.ext_desc) > 90 else ""), classes="ext-desc")
+
+        with Container(classes="ext-actions", id="action_container"):
+            yield Button("Versions", variant="primary", classes="ver-btn")
+
+    @on(Button.Pressed, ".ver-btn")
+    def on_versions_click(self):
+        self.app.push_screen(
+            VersionSelectScreen(self.ext_namespace, self.ext_name),
+            self.on_version_selected
+        )
+
+    def on_version_selected(self, result):
+        if result is None:
+            return
+        version, download_url = result
+        self.post_message(self.InstallRequest(self.data, self, download_url, version))
+
+    def set_loading(self, is_loading: bool, version: str = ""):
+        container = self.query_one("#action_container")
+        container.remove_children()
+        if is_loading:
+            container.mount(LoadingIndicator())
+            self.add_class("installing")
+        else:
+            container.mount(Button(f"Inst: {version}", variant="success", disabled=True))
+            self.remove_class("installing")
+
+    def reset_button(self):
+        container = self.query_one("#action_container")
+        container.remove_children()
+        container.mount(Button("Versions", variant="primary", classes="ver-btn"))
+        self.remove_class("installing")
+
+
+class VSXManager(App):
+    CSS = """
+    Screen {
+        layout: grid;
+        grid-size: 2 2;
+        grid-columns: 25 1fr;
+        grid-rows: auto 1fr;
+    }
+
+    #sidebar {
+        row-span: 2;
+        background: $panel;
+        border-right: vkey $background;
+        padding: 1;
+    }
+
+    #sidebar Label {
+        padding-bottom: 1;
+        text-style: bold;
+        color: $accent;
+    }
+
+    #search_container {
+        padding: 1;
+        height: auto;
+    }
+
+    #search_input {
+        border: tall $accent;
+    }
+
+    #results_container {
+        padding: 0 1;
+        overflow-y: scroll;
+    }
+
+    ExtensionRow {
+        layout: horizontal;
+        height: 6;
+        margin-bottom: 1;
+        background: $surface;
+        padding: 1;
+        border: solid $primary-background;
+    }
+    ExtensionRow:hover {
+        background: $surface-lighten-1;
+    }
+
+    .ext-logo {
+        width: 5;
+        height: 3;
+        background: $primary;
+        color: white;
+        content-align: center middle;
+        margin-right: 1;
+        text-style: bold;
+    }
+
+    .ext-meta {
+        width: 1fr;
+    }
+
+    .ext-title {
+        color: $text;
+    }
+
+    .ext-subtitle {
+        height: 1;
+        margin-top: 0;
+    }
+
+    .ext-publisher {
+        margin-right: 2;
+    }
+
+    .ext-downloads {
+        color: $warning;
+    }
+
+    .ext-desc {
+        color: $text-muted;
+        margin-top: 1;
+    }
+
+    .ext-actions {
+        width: 14;
+        content-align: right middle;
+    }
+
+    LoadingIndicator {
+        height: 1;
+        color: $accent;
+    }
+    """
+
+    CATEGORIES = [
+        "All", "Programming Languages", "Themes", "Snippets",
+        "Linters", "Formatters", "Debuggers", "Education"
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sidebar"):
+            yield Label("CATEGORIES")
+            yield OptionList(*self.CATEGORIES, id="category_list")
+
+        with Container(id="search_container"):
+            yield Input(placeholder="Search extensions...", id="search_input")
+
+        with Vertical(id="results_container"):
+            yield LoadingIndicator(id="main_loader", classes="hidden")
+            yield Container(id="extension_list_display")
+
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#search_input").focus()
+        self.query_one("#category_list").highlighted = 0
+        self.query_one("#main_loader").display = False
+
+    async def perform_search(self, query: str = "", category: str = "All"):
+        results_display = self.query_one("#extension_list_display")
+        loader = self.query_one("#main_loader")
+
+        results_display.remove_children()
+        loader.display = True
+
+        final_query = query
+        if category and category != "All":
+            final_query = f'{query} category:"{category}"'.strip()
+
+        if not final_query:
+            final_query = ""
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                params = {"query": final_query, "size": 20}
+                resp = await client.get(API_SEARCH, params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+
+                extensions = data.get("extensions", [])
+
+                loader.display = False
+
+                if not extensions:
+                    results_display.mount(Label(f"No results found for '{final_query}'"))
+                    return
+
+                for i, ext in enumerate(extensions):
+                    ext_id_name = f"ext-row-{i}"
+                    results_display.mount(ExtensionRow(ext, id=ext_id_name))
+
+        except Exception as e:
+            loader.display = False
+            results_display.mount(Label(f"[red]Error: {e}"))
+
+    async def on_input_submitted(self, event: Input.Submitted):
+        cat_list = self.query_one("#category_list")
+        selected_idx = cat_list.highlighted
+        category = self.CATEGORIES[selected_idx] if selected_idx is not None else "All"
+        await self.perform_search(event.value, category)
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        query = self.query_one("#search_input").value
+        category = str(event.option.prompt)
+        await self.perform_search(query, category)
+
+    @work(exclusive=True)
+    async def on_extension_row_install_request(self, message: ExtensionRow.InstallRequest):
+        widget = message.widget
+        ext_data = message.ext_data
+        download_url = message.download_url
+        target_version = message.version
+
+        if not download_url:
+            self.notify("Could not find download URL.", severity="error")
+            widget.reset_button()
+            return
+
+        widget.set_loading(True)
+        self.notify(f"Downloading {ext_data.get('name')} v{target_version}...", title="Status", severity="information")
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".vsix", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                async with client.stream("GET", download_url) as response:
+                    response.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
+
+            self.notify("Installing...", title="Status", severity="information")
+
+            cmd = ["code-server", "--install-extension", tmp_path]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode == 0:
+                self.notify(f"Installed {ext_data.get('name')} v{target_version}", title="Success", severity="information")
+                widget.set_loading(False, version=target_version)
+            else:
+                error_msg = stderr.decode().strip() or "Installation failed."
+                self.notify(f"Failed: {error_msg}", title="Error", severity="error")
+                widget.reset_button()
+
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+            widget.reset_button()
+
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+if __name__ == "__main__":
+    VSXManager().run()
